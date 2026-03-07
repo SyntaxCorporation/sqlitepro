@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+
+import sqlite3
+import readline
+import argparse
+from sys import argv
+from os import system
+from re import fullmatch
+from pathlib import Path
+from shutil import rmtree
+from subprocess import run
+from json import dumps, loads
+from string import ascii_letters
+from random import randint, choice
+from colorama import init, Fore, Back, Style
+from rich.traceback import install
+
+install()
+init(autoreset=True)
+parser = argparse.ArgumentParser(prog="sqlitepro")
+subparsers = parser.add_subparsers(dest="command", required=True)
+
+connect = subparsers.add_parser("connect", help="Connect SQLiteaPro to the Database Dir")
+connect.add_argument("dir", type=str)
+
+delete = subparsers.add_parser("delete", help="Delete Database Directory")
+delete.add_argument("dir", type=str)
+
+args = parser.parse_args()
+
+def pretty_print(data, depth = 0, indent = 2, sdepth = False, comma = False):
+	if isinstance(data, list):
+		if not sdepth:
+			print(depth * (" " * indent), end = "")
+		print(Fore.BLUE + Style.BRIGHT + "[" + Style.RESET_ALL)
+		for i in data:
+			if comma:
+				print(",")
+			else:
+				comma = True
+			if isinstance(i, bool) or i is None:
+				print((depth + 1) * (" " * indent), end = "")
+				print(Fore.BLUE + str(i), end = "")
+			elif isinstance(i, int) or isinstance(i, float):
+				print((depth + 1) * (" " * indent), end = "")
+				print(Fore.CYAN + str(i) + Style.RESET_ALL, end = "")
+			elif isinstance(i, str):
+				print((depth + 1) * (" " * indent), end = "")
+				print(Fore.MAGENTA + f'\"{i}\"', end = "")
+			else:
+				pretty_print(i, depth + 1)
+		print("\n" + (depth * (" " * indent)), end = "")
+		print(Fore.BLUE + Style.BRIGHT + "]" + Style.RESET_ALL, end = "")
+	elif isinstance(data, dict):
+		if not sdepth:
+			print(depth * (" " * indent), end = "")
+		print(Fore.BLUE + Style.BRIGHT + "{" + Style.RESET_ALL)
+		for k, v in zip(data.keys(), data.values()):
+			if comma:
+				print(",")
+			else:
+				comma = True
+			print((depth + 1) * (" " * indent) , end = "")
+			if isinstance(k, int) or isinstance(k, float):
+				print(Fore.YELLOW + Style.DIM + str(k) + Style.RESET_ALL + ": ", end = "")
+			else:
+				print(Fore.YELLOW + f'\"{k}\"' + Fore.RESET + ": ", end = "")
+			if isinstance(v, bool) or v is None:
+				print(Fore.BLUE + str(v), end = "")
+			elif isinstance(v, int) or isinstance(v, float):
+				print(Fore.CYAN + str(v) + Style.RESET_ALL, end = "")
+			elif isinstance(v, str):
+				print(Fore.MAGENTA + f'\"{v}\"', end = "")
+			else:
+				pretty_print(v, depth + 1, sdepth = True)
+			
+		print("\n" + (depth * (" " * indent)), end = "")
+		print(Fore.BLUE + Style.BRIGHT + "}" + Style.RESET_ALL, end = "")
+	
+	if depth == 0:
+		print("")
+	
+
+db_fields = ["*"]
+placeholder = [" "]
+values = []
+elements = []
+def query_generator(query, fields = {}, OR = False, kwd = "="):
+	def placeholder_maker(kwd, isand = True):
+		if kwd == "$in":
+			placeholder.append(f" WHERE EXISTS (SELECT 1 FROM json_each(data.{".".join(elements)}) WHERE value = ?)")
+		elif kwd == "$and":
+			placeholder[-1] += (f" json_extract(data, $.{".".join(elements)}) = ?")
+			isand = False
+		elif kwd in keywords:
+			placeholder[-1] += f" json_extract(data, $.{".".join(elements)}) {keyword_converter(kwd)} ?"
+		else:
+			placeholder[-1] += f" json_extract(data, $.{".".join(elements)}) = ?"
+		if isand:
+			placeholder[-1] += " AND "
+	def keyword_converter(kwd):
+		if kwd == "$eq":
+			return "="
+		elif kwd == "$gt":
+			return ">"
+		elif kwd == "$lt":
+			return "<"
+		elif kwd == "$le":
+			return "<="
+		elif kwd == "$ge":
+			return ">="
+			
+	keywords = ["$gt", "$lt", "$ge", "$le", "$eq", "$and", "$in"]
+	
+	print("\n", query, "\n")
+	for k, v in zip(query.keys(), query.values()):
+		if k in keywords:
+			if k == "$and":
+				if isinstance(v, list):
+					for i in v:
+						if OR:
+							placeholder[-1] += " OR "
+						else:
+							OR = True
+						query_generator(i, kwd = k)
+				else:
+					print(Fore.WHITE + Style.RED + "Invalid Value...\nUse Array datatype with '$in'..." + Style.RESET_ALL)
+					return 1
+			elif k == "$in":
+				if isinstance(v, list):
+					values.append(tuple(v))
+				else:
+					print(Fore.WHITE + Style.RED + "Invalid Value...\nUse Array datatype with '$in'..." + Style.RESET_ALL)
+					return 1
+			else:
+				if isinstance(v, dict):
+					query_generator(v, kwd = k)
+				else:
+					placeholder[-1] = placeholder[-1][:-3] + keyword_converter(k) + " ?"
+					values.append(v)
+		else:
+			elements.append(k)
+			placeholder_maker(kwd)
+			if isinstance(v, dict):
+				query_generator(v)
+			else:
+				values.append(v)
+			elements.pop()
+			
+				
+			
+	if len(fields) > 0:
+		db_fields.clear()
+		if len(fields) == 1 or len(fields) == 2 and "_id" in fields.keys():
+			for k, v in zip(fields.keys(), fields.values()):
+				if isinstance(v, int) and v:
+					db_fields.append(f" json_extract(data, $.{k})")
+		else:
+			print("Invalid Placeholder...")
+			return 1
+	
+	print("\n", " AND ".join(placeholder))
+	print("\n", tuple(values))
+	return ",".join(db_fields), None, tuple(values)
+			
+			
+class databaseCmnd:
+	def __init__(self):
+		self.input_text = "> "
+		self.loop = True
+		self.currentDB = ""
+		self.hst_file = Path.home() / ".sqlite_history"
+		
+	def close(self):
+		if (self.input_text != "> "):
+			self.conn.commit()
+			self.conn.close()
+			self.input_text = "> "
+			self.currentDB = self.input_text.split(">")[0].strip()
+			self.conn = ""
+		
+	def use(self, file_name):
+		if (len(file_name.split(".")) < 2 
+			and fullmatch(r'^[^0-9][\w]*', file_name)):
+			self.close()
+			self.input_text =  f"{file_name}> "
+			self.currentDB = self.input_text.split(">")[0].strip()
+			file_name = db_dir / file_name
+			self.conn = sqlite3.connect(f"{file_name}.db")
+			self.cursor = self.conn.cursor()
+			db_data()
+		else:
+			print("Do not use (spaces), (symbols except '_'), and (numbers in the starting) in collection name...")
+		
+	def dropDatabase(self):
+		if (self.currentDB != ""):
+			database = db_dir / f"{self.currentDB}.db"
+			self.close()
+			database.unlink()
+			db_data()
+		else:
+			print("Use a database first...")
+	
+	def createCollection(self, table):
+		if self.currentDB != "":
+			if (fullmatch(r'^[^0-9][\w]*', table)):
+				self.cursor.execute(f"CREATE TABLE IF NOT EXISTS {table} (data TEXT)")
+			else:
+				print("Do not use (spaces), (symbols except '_'), and (numbers in the starting) in collection name...")
+		else:
+			print("Please use a database first...")
+			
+			
+class collectionCmnd:
+	def __init__(self, new_instance, table):
+		self.db_self = new_instance
+		self.table = table
+		
+	def drop(self):
+		try:
+			self.db_self.cursor.execute(f"DROP TABLE {self.table}")
+		except:
+			print("Collection does not exists...")
+		
+	def insertOne(self, data):
+		unq_id = ""
+		for i in range(10):
+			if choice([True, False]):
+				unq_id += str(randint(0, 9))
+			else:
+				unq_id += choice(ascii_letters)
+		data_str = dumps({"_id": unq_id, **data})
+		self.db_self.cursor.execute(f'''
+			INSERT INTO {self.table} (data) VALUES (?)
+		''', (data_str,))
+		
+	def insertMany(self, data):
+		def unq_id_generator():
+			unq_id = ""
+			for i in range(10):
+				if choice([True, False]):
+					unq_id += str(randint(0, 9))
+				else:
+					unq_id += choice(ascii_letters)
+			return unq_id
+		tupled_data = [(dumps({"_id": unq_id_generator(), **d}),) for d in data]
+		self.db_self.cursor.executemany(f"""
+			INSERT INTO {self.table} (data) VALUES (?)
+		""", tupled_data)
+		
+	def find(self, query = {}, fields = {}):
+		def pretty():
+			pass
+		if len(query) > 0:
+			clauses = []
+			db_fields = []
+			placeholder = []
+			values = []
+			f, p, v = query_generator(query, fields)
+			
+			"""raw_data = self.db_self.cursor.execute(f'''
+				SELECT 
+				{",".join(f)}
+				FROM
+				{self.table}
+				WHERE
+				{p}
+			''', v).fetchall()"""
+			
+		else:
+			raw_data = self.db_self.cursor.execute(f"SELECT data FROM {self.table}").fetchall()
+			data = [loads(row[0]) for row in raw_data]
+			pretty_print(data)
+		
+class defaultCmnd:
+	def __init__(self, new_instance):
+		self.db_self = new_instance
+		
+	def close(self):
+		print("Closing the database...")
+		readline.write_history_file(self.db_self.hst_file)
+		self.db_self.loop = False
+		self.db_self.close()
+		print("Database closed successfully...\n")
+			
+	def show_dbs(self):
+		for db_name in db_names:
+			print(db_name.split(".")[0])
+									
+	def clear(self):
+		system("clear")
+									
+	def show_cols(self):
+		if self.db_self.currentDB != "":
+			cols = self.db_self.cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+			if len(cols) > 0:
+				for col in cols:
+					print(col[0])
+			else:
+				#pretty_print({"Object": 0})
+				test_var = {
+					"Object": 0,
+					"Status": "Not Complete",
+					"In Development": True,
+					"Test Nested List": [
+						"Element 1",
+						"Element 2",
+						"Element 3",
+						{
+							"Nested Element of Dictionary": True,
+							"Is Working": "Not Sure",
+							"Is Developed": 1
+						}
+					],
+					"Test Nested Dictionary": {
+						"Key 1": "Value 1",
+						"Key 2": "Value 2",
+						"Key 3": "Value 3",
+						"Key of Nested List": [
+							"Element 1",
+							"Element 2",
+							"Element 3",
+						]
+					}
+				}
+				print(test_var, end = "\n\n\n")
+				pretty_print(test_var)
+
+		else:
+			print("Use a database first to see its collections...")
+			
+	def show_crnt_db(self):
+		if (self.db_self.currentDB != ""):
+			print(self.db_self.currentDB)
+		else:
+			pretty_print({"Object": 0})
+			
+		
+		
+if len(argv) == 1:
+	print(f"""
+{Fore.RED + Style.BRIGHT + "SQLitePro" + Style.RESET_ALL} - Version: {Fore.CYAN + Style.BRIGHT + "0.6.8" + Style.RESET_ALL}
+Copyright (C) 2025 by {Style.BRIGHT + "Syntax Corporation"}
+""")
+
+elif len(argv) == 2:
+	options = ["connect", "delete"]
+	if argv[1] not in options:
+		print(f"'{argv[1]}' is not an option...\n")
+		
+	else:
+		print(f"Please provide the database directory after '{argv[1]}' option...\n")
+
+elif args.command in ["connect", "delete"]:
+	options = ["connect", "delete"]
+	print(f"Connecting to database directory...")
+	if argv[1] in options:
+		db_dir = Path(args.dir).resolve()
+		supported_formats = ["sqlite", "sqlite3", "db"]
+		def db_data():
+			global db_names
+			db_dir_files = [file.name for file in db_dir.iterdir()]
+			db_names = []
+			for db_file in db_dir_files:
+				if (str(db_file).split(".")[1] in  supported_formats):
+					db_names.append(db_file)
+		
+		def recursion():
+			if (db_dir.exists()):
+				if (db_dir.is_dir()):
+					if (argv[1] == "connect"):
+						print("Connected successfully...")
+						print("Use 'close()' to stop the SQLitePro...\n")
+						commands = {
+							"show dbs": "show_dbs",
+							"show databases": "show_dbs",
+							"cls": "clear",
+							"clear": "clear",
+							"show collections": "show_cols",
+							"show cols": "show_cols",
+							"db": "show_crnt_db",
+							"close()": "close"
+						}
+						
+						db = databaseCmnd()
+						db.hst_file.touch()
+						readline.read_history_file(db.hst_file)
+						dfCmnd = defaultCmnd(db)
+						colCmnd = collectionCmnd(db, None)
+						db_data()
+						if __name__ == "__main__":
+							while db.loop:
+								try:
+									usr = input(db.input_text).strip()
+									
+									if (usr == ""):
+										pass
+										
+									elif (usr.lower() in commands.keys()):
+										getattr(dfCmnd, commands[usr.lower()])()
+										
+									elif (len(usr.split(" ")) == 2
+										and usr.split(" ")[0].lower() == "use"):
+										db.use(usr.split(" ")[1].strip())
+										
+									else:
+										cmd_array = usr.split(".")
+										if (len(cmd_array) == 2
+											and hasattr(db, cmd_array[1].split("(")[0])):
+											exec(usr)
+												
+										elif (len(cmd_array) == 3
+											and hasattr(colCmnd, cmd_array[2].split("(")[0])):
+											setattr(db, cmd_array[1], collectionCmnd(db, cmd_array[1]))
+											exec(usr)
+											
+										else:
+											print(f"'{usr}' is not a command...")
+											
+								except KeyboardInterrupt:
+									print("\nUse 'close()' to close the SQLitePro...")
+									dfCmnd.close()
+
+								except EOFError:
+									print("\nUse 'close()' to close the SQLitePro...")
+									dfCmnd.close()
+								
+								except Exception as e:
+									raise
+									print(f"Error: {e}")
+					
+					else:
+						deletionConfirmation = input("Are you sure (y/n): ")
+						if (deletionConfirmation in ["y", "Y"]):
+							try:
+								rmtree(db_dir)
+								print(f"'{db_dir}' has been deleted successfully...\n")
+							
+							except:
+								print(f"An error has occured while deleting the '{db_dir}' database directory...\n")
+							
+				else:
+					print(f"'{db_dir}' is not a directory...\n")
+			
+			else:
+				if (argv[1] == "connect"):
+					print(f"Directory '{db_dir}' does not exist...")
+					creation_input = input("Do you want to create it (y/n): ")
+					if (creation_input in ["y", "Y"]):
+						print("Creating database directory...")
+						db_dir.mkdir()
+						print("Database directory created successfully...\n")
+						recursion()
+						
+					else:
+						print("Creation cancel...\n")
+						
+				else:
+					print(f"'{db_dir}' is not exists...\n")
+				
+		recursion()
+			
+	else:
+		print(f"'{argv[1]}' is not an option...\n")
+	
+else:
+	print(f"SQLitePro only takes maximum two arguments...\n")
